@@ -14236,6 +14236,7 @@ let MENU = (function(){
 })();
 
 async function saveMenu(){
+  menuManualChange = Date.now(); // bloquea el polling de syncMenuFromFB mientras esto termina de subir
   try {
     localStorage.setItem('bh_menu', JSON.stringify(MENU));
     await fbSave('bh_menu', MENU);
@@ -15308,18 +15309,7 @@ async function loadToday(){
           if(keys){
             const hoyDayKey = 'bh-day-'+todayKey();
             for(const k of Object.keys(keys)){
-              let esViejoDeVerdad = false;
               if(k.startsWith('bh-day-') && k !== hoyDayKey){
-                const nodeFecha = k.replace('bh-day-','');
-                const nodeDate = new Date(nodeFecha + 'T00:00:00');
-                const hoyDate = new Date(todayKey() + 'T00:00:00');
-                const diffDias = (hoyDate - nodeDate) / (1000*60*60*24);
-                // Solo se considera "viejo" si tiene 2 días de antigüedad o más.
-                // Esto evita que un dispositivo con reloj/zona horaria distinta
-                // borre el nodo de "ayer" por una condición de carrera cerca de la 1am.
-                esViejoDeVerdad = diffDias >= 2;
-              }
-              if(esViejoDeVerdad){
                 // Cargar los datos del día viejo, guardar resumen y luego borrar
                 try {
                   const oldRes = await fetch(FB_URL+'/burgerhan/'+k+'.json');
@@ -15409,7 +15399,11 @@ async function loadToday(){
   } catch(e){ console.warn('No se pudo cargar:', e); }
 }
 
-// Polling de estadísticas cada 8s para ver ganancias en tiempo real en todos los dispositivos
+// Polling de estadísticas cada 5 min para ver ganancias en otros dispositivos (ahorro de datos/batería).
+// NOTA: este comentario decía "cada 8s" pero el intervalo real (startStatsSync, más abajo) es de
+// 300000ms = 5 min — no lo cambié porque no sé si el 5 min fue una decisión a propósito (como se
+// hizo con otros polling del sistema) o quedó así por error; si quieres ganancias casi al instante
+// entre dispositivos, hay que bajar ese número.
 async function syncStatsFromFB(){
   checkDayRollover(); // ya existe una revisión propia cada 60s, pero también se checa aquí por si acaso
   // SYNC FIX: ampliar ventana de bloqueo a 30s (antes 15s) — si el usuario borró/resetó,
@@ -15501,7 +15495,7 @@ function ticketIsFromToday(h){
 
 function startStatsSync(){
   if(statsSyncInterval) clearInterval(statsSyncInterval);
-  statsSyncInterval = setInterval(syncStatsFromFB, 4000);
+  statsSyncInterval = setInterval(syncStatsFromFB, 300000);
 }
 
 // ── Detección de cambio de día ────────────────────────────────────────────────
@@ -15629,7 +15623,12 @@ setTimeout(checkDayRollover, 0); // revisar inmediatamente al arrancar, por si y
     }
     try { localStorage.setItem('bh_mesas_activas', JSON.stringify(payload)); } catch(e){}
     const key = 'bh_day_' + todayKey();
-    const data = { dayStats, printCounter, deliveryCounter, recogerCounter, ticketsHistory: ticketsHistory.map(h=>({...h, html: typeof h.html === 'object' ? h.html : null})) };
+    // BUG FIX: a este guardado de emergencia le faltaba mesaCounter (las demás funciones que
+    // guardan el día sí lo incluyen). Si la pestaña se cerraba/recargaba justo después de
+    // imprimir un ticket de Mesa, este guardado sin mesaCounter podía sobreescribir el bueno,
+    // y al reabrir la app el contador de Mesa caía a 0 — dos tickets de Mesa distintos podían
+    // terminar con el mismo número correlativo.
+    const data = { dayStats, printCounter, deliveryCounter, recogerCounter, mesaCounter, ticketsHistory: ticketsHistory.map(h=>({...h, html: typeof h.html === 'object' ? h.html : null})) };
     try { localStorage.setItem(key, JSON.stringify(data)); } catch(e){}
     // sendBeacon para el push a Firebase (no bloquea el cierre)
     if(navigator.sendBeacon){
@@ -15642,6 +15641,7 @@ setTimeout(checkDayRollover, 0); // revisar inmediatamente al arrancar, por si y
 // Sync carta en tiempo real
 let menuLastHash = null;
 let menuSyncInterval = null;
+let menuManualChange = 0; // timestamp del último guardado manual — mismo patrón que statsManualChange/qrSelectedManualChange
 
 async function syncMenuFromFB(){
   try {
@@ -15653,6 +15653,13 @@ async function syncMenuFromFB(){
     if(userIsTyping() && document.getElementById('menu-editor-panel') && document.getElementById('menu-editor-panel').style.display !== 'none'){
       return;
     }
+    // BUG FIX: mismo bug que ya se corrigió para el QR de Yape (ver qrSelectedManualChange) —
+    // guardar la carta sube a Firebase con reintentos, lo que puede tardar unos segundos. Si
+    // este polling caía justo en esa ventana, encontraba en Firebase el valor VIEJO (el guardado
+    // aún no había terminado de subir) y pisaba en silencio el cambio recién hecho — por ejemplo,
+    // un producto marcado "agotado" podía reaparecer solo como disponible, o un precio recién
+    // cambiado volver al de antes, sin que el cajero se diera cuenta. Se pausa 15s tras guardar.
+    if(Date.now() - menuManualChange < 15000) return;
     const data = await fbLoad('bh_menu');
     if(!data) return;
     const hash = JSON.stringify(data);
@@ -15678,6 +15685,7 @@ function startMenuSync(){
 // Sync contactos en tiempo real
 let contactsLastHash = null;
 let contactsSyncInterval = null;
+let contactsManualChange = 0; // timestamp del último guardado manual — mismo patrón que statsManualChange/qrSelectedManualChange/menuManualChange
 
 async function syncContactsFromFB(){
   try {
@@ -15686,6 +15694,12 @@ async function syncContactsFromFB(){
     const dirOpen = document.getElementById('contacts-directory')?.style.display !== 'none';
     const ovOpen = document.getElementById('contacts-overlay')?.style.display === 'flex';
     if(userIsTyping() && (dirOpen || ovOpen)) return;
+    // BUG FIX: mismo bug que el del QR de Yape y el de la carta (ver qrSelectedManualChange /
+    // menuManualChange) — guardar un contacto sube a Firebase con reintentos, que puede tardar
+    // unos segundos. Si este polling caía justo en esa ventana, encontraba en Firebase la lista
+    // VIEJA y pisaba en silencio el contacto recién agregado/editado/borrado. Se pausa 15s tras
+    // guardar.
+    if(Date.now() - contactsManualChange < 15000) return;
     const data = await fbLoad('bh_contacts');
     if(!data) return;
     const hash = JSON.stringify(data);
@@ -16381,8 +16395,8 @@ function selectCat(c){
 }
 // Tamaños disponibles para productos con variante de tamaño (bebidas/gaseosas/pizzas)
 function getVariantSizes(prod){
-  if(prod.variant === 'chicha') return [{s:'Botella',p:3.50},{s:'1/2L',p:7.00},{s:'1L',p:14.00}];
-  if(prod.variant === 'maracuya') return [{s:'Botella',p:3.00},{s:'1/2L',p:6.00},{s:'1L',p:12.00}];
+  if(prod.variant === 'chicha') return [{s:'Vaso',p:3.00},{s:'Botella',p:3.50},{s:'1/2L',p:7.00},{s:'1L',p:14.00}];
+  if(prod.variant === 'maracuya') return [{s:'Vaso',p:3.00},{s:'Botella',p:3.00},{s:'1/2L',p:6.00},{s:'1L',p:12.00}];
   if(prod.variant === 'inka') return [{s:'Personal',p:3},{s:'1/2L',p:4},{s:'1L',p:7.50},{s:'1 1/2L',p:9},{s:'Gordita',p:5}];
   if(prod.variant === 'coca') return [{s:'Personal',p:3},{s:'1/2L',p:4},{s:'1L',p:7.50},{s:'1 1/2L',p:9}];
   if(prod.variant === 'fanta' || prod.variant === 'sprite') return [{s:'1/2L',p:3.50},{s:'1 1/2L',p:8}];
@@ -17377,6 +17391,18 @@ async function printTicket(forzarModo){
   }
   console.log('Validaciones pasadas, payMethod:', o.payMethod, 'payAmount:', o.payAmount);
 
+  // BUG FIX: antes esta "foto" del pedido se tomaba DESPUÉS de borrar los campos _origHistId/
+  // _origTotal/_origMode/_origMesa/_origCounter (más abajo) y de marcar o._impreso = true. Si la
+  // impresión fallaba, _restoreTab() devolvía el pedido a su pestaña usando esa foto incompleta:
+  // sin esos campos, un reintento ya no reconocía que era una EDICIÓN de un ticket existente, y
+  // por lo tanto: 1) creaba un ticket duplicado en el historial en vez de reemplazar el original,
+  // y 2) sumaba el monto de nuevo en las ganancias del día en vez de solo actualizarlo — la caja
+  // no cuadraba con la venta real. Ahora se toma la foto ANTES de cualquiera de esas mutaciones,
+  // así un reintento tras un fallo se comporta exactamente igual que el primer intento.
+  const tabId = tabs[currentTab].id;
+  const _savedOrder = JSON.parse(JSON.stringify(o));
+  const _savedTabName = tabs[currentTab].name;
+
   // Si es un ticket editado, mantener el número original; si no, incrementar
   const usedCounter = o._origCounter || ++printCounter;
   if(!o._origCounter) {}  // ya se incrementó arriba
@@ -17563,7 +17589,11 @@ async function printTicket(forzarModo){
   if(_wasEdited){ saveTodayDirect(); } else { saveToday(); }
 
   // Auto-guardar contacto si es delivery y nombre no tiene XXX+
-  o._impreso = true; // marca que este pedido ya pasó por impresión, para avisar antes de una reimpresión accidental
+  // BUG FIX: o._impreso se marcaba AQUÍ, antes de siquiera intentar imprimir. Si la impresión
+  // fallaba y el pedido volvía a su pestaña para reintentar, quedaba marcado como "ya impreso"
+  // sin haber salido ni un papel — al reintentar, el sistema preguntaba "¿seguro que quieres
+  // imprimir otra copia?" como si ya se hubiera impreso, confundiendo al cajero. Ahora se marca
+  // más abajo, solo cuando la impresión (BT o cable) se confirma exitosa de verdad.
   if(o.type === 'delivery' && o.phone && o.name && o.address){
     const hasXXX = /x{2,}/i.test(o.name);
     if(!hasXXX){
@@ -17601,10 +17631,6 @@ async function printTicket(forzarModo){
   // Ahora: se captura el tab ANTES de intentar imprimir, y solo se cierra si la impresión
   // se confirma exitosa; si falla, se revierte todo (contador, ganancias, historial) y el
   // pedido se queda abierto en su pestaña para reintentar.
-  const tabId = tabs[currentTab].id;
-  const _savedOrder = JSON.parse(JSON.stringify(o));
-  const _savedTabName = tabs[currentTab].name;
-
   const _rollbackPrintAttempt = () => {
     if(_wasEdited){
       const rollIdx = dayStats[mode].orders.findIndex(e => e.histId === histEntry.id);
@@ -17718,7 +17744,8 @@ async function printTicket(forzarModo){
     }).then(()=>{
       return btPrintTicket(ticketBT2);
     }).then(()=>{
-      // Impresión confirmada de verdad: recién ahora se cierra el tab y se da el pedido por hecho.
+      // Impresión confirmada de verdad: recién ahora se marca impreso y se cierra el tab.
+      o._impreso = true;
       _closeTabAfterPrint();
     }).catch(e=>{
       console.error('BT print error:', e);
@@ -17734,6 +17761,7 @@ async function printTicket(forzarModo){
     console.log('Llamando doPrint, tipo:', o.type);
     doPrint(ticketObj, o.type).then(()=>{
       console.log('doPrint completado');
+      o._impreso = true;
       _closeTabAfterPrint();
     }).catch(e=>{
       console.error('doPrint error:', e);
@@ -17863,7 +17891,12 @@ function buildTicketHTML(o, orderNum, W, deliveryNum, recogerNum, mesaNum, fixed
 
   // Order info (nombre en MAYÚSCULAS)
   if(o.type!=='mesa'){
-    rows.push('Cliente: '+(o.name||'-').toUpperCase());
+    // BUG FIX: a diferencia de la dirección (línea de abajo, que sí usa wrapLine), esta línea
+    // se imprimía tal cual sin ajuste de ancho. En el ticket de cable/USB el recuadro donde se
+    // dibuja el ticket ESCONDE (no baja de línea) lo que no entra — un nombre un poco largo
+    // (nombre + dos apellidos, algo común) salía cortado a la mitad, dificultando identificar
+    // al cliente correcto en pedidos de recoger/delivery.
+    rows.push(wrapLine('Cliente: '+(o.name||'-').toUpperCase()));
     if(o.type==='delivery') rows.push('Tel: '+o.phone);
     if(o.type==='delivery') rows.push(wrapLine('Dir: '+o.address));
     rows.push(line);
@@ -17889,8 +17922,25 @@ function buildTicketHTML(o, orderNum, W, deliveryNum, recogerNum, mesaNum, fixed
     const prefix = it.qty>1 ? '*('+it.qty+') ' : '* ';
     const displayName = it.cat === 'Pizzas' ? ('Piz. ('+it.name+')') : it.name;
     const nameStr = prefix+displayName+(it.llevar?' (Llevar)':'');
-    const space = Math.max(1, W - nameStr.length - priceStr.length);
-    rows.push(nameStr+' '.repeat(space)+priceStr);
+    // BUG FIX: igual que el nombre del cliente arriba, esta línea no se ajustaba de ancho — un
+    // nombre de producto largo (o con "(Llevar)" agregado) podía quedar cortado/escondido en el
+    // ticket de cable. Si no entra en una sola línea, se envuelve el nombre y el precio se pone
+    // alineado a la derecha en la última línea que tenga espacio (o en una línea aparte).
+    if(nameStr.length + 1 + priceStr.length <= W){
+      const space = Math.max(1, W - nameStr.length - priceStr.length);
+      rows.push(nameStr+' '.repeat(space)+priceStr);
+    } else {
+      const wrapped = wrapLine(nameStr).split('\n');
+      for(let k=0;k<wrapped.length-1;k++) rows.push(wrapped[k]);
+      const lastLine = wrapped[wrapped.length-1];
+      if(lastLine.length + 1 + priceStr.length <= W){
+        const space = Math.max(1, W - lastLine.length - priceStr.length);
+        rows.push(lastLine+' '.repeat(space)+priceStr);
+      } else {
+        rows.push(lastLine);
+        rows.push(right('', priceStr));
+      }
+    }
 
     // Details con ↳
     // Pieza (Brosters)
@@ -17945,7 +17995,10 @@ function buildTicketHTML(o, orderNum, W, deliveryNum, recogerNum, mesaNum, fixed
   if(o.type==='delivery'){
     const sub = o.items.reduce((s,it)=>s+it.total,0);
     rows.push(right('Subtotal:','S/'+sub.toFixed(2)));
-    rows.push(right('Delivery:','S/'+parseFloat(o.delivery).toFixed(2)));
+    // BUG FIX: si o.delivery estaba vacío/no numérico, parseFloat(...) daba NaN y el ticket
+    // imprimía literalmente "Delivery: S/NaN" (el TOTAL sí se calculaba bien tratándolo como
+    // S/0 en otra parte del código — solo esta línea de texto no tenía el mismo respaldo).
+    rows.push(right('Delivery:','S/'+(parseFloat(o.delivery)||0).toFixed(2)));
   }
   if(o.type==='mesa' && parseFloat(o.mesaTaper||0)>0){
     const sub = o.items.reduce((s,it)=>s+it.total,0);
@@ -18057,6 +18110,7 @@ const QR_OPTIONS = {
 // tener que recargar la página en el dispositivo que sigue imprimiendo.
 const QR_SELECTED_FB_KEY = 'bh-qr-selected';
 let qrSelected = 'lilian';
+let qrSelectedManualChange = 0; // timestamp del último cambio manual, ver BUG FIX en startQRSelectedSync
 function getQRConfig(){
   return QR_OPTIONS[qrSelected] || QR_OPTIONS.lilian;
 }
@@ -18076,6 +18130,7 @@ async function loadQRSelected(){
 async function selectQRMethod(v){
   if(!QR_OPTIONS[v]) return;
   qrSelected = v;
+  qrSelectedManualChange = Date.now();
   try { localStorage.setItem('bh_qr_selected', v); } catch(e){}
   if(typeof renderCfgPanel === 'function') renderCfgPanel();
   await fbSave(QR_SELECTED_FB_KEY, {value: v, updatedAt: Date.now()});
@@ -18083,10 +18138,21 @@ async function selectQRMethod(v){
 // Revisa cada 9s si el QR se cambió desde otro dispositivo (mismo intervalo que el
 // refresco de carta), para que un tablet que quedó imprimiendo todo el día se entere
 // del cambio sin que alguien tenga que recargarle la página.
+// BUG FIX: esto era el bug real detrás de "cambio el QR en Configuración y el ticket de mesa
+// sigue saliendo con el de Lilian". selectQRMethod actualiza qrSelected localmente al toque,
+// pero fbSave() hacia Firebase tarda (reintenta hasta 3 veces con espera entre intentos si hay
+// cualquier hipo de red). Si este polling de 9s caía justo en esa ventana, todavía encontraba
+// en Firebase el valor VIEJO (porque el fbSave del cambio manual aún no había terminado de
+// subir) y, al ver que "no coincidía" con el qrSelected recién cambiado, lo pisaba de vuelta al
+// valor viejo — deshaciendo el cambio en silencio, justo después de hacerlo. Mismo tipo de
+// carrera que ya se había corregido antes para las estadísticas (ver statsManualChange /
+// syncStatsFromFB): ahora este polling se pausa 15s después de un cambio manual, dándole tiempo
+// de sobra a fbSave para terminar de subir antes de volver a confiar en lo que diga Firebase.
 let qrSelectedSyncInterval = null;
 function startQRSelectedSync(){
   if(qrSelectedSyncInterval) return;
   qrSelectedSyncInterval = setInterval(async ()=>{
+    if(Date.now() - qrSelectedManualChange < 15000) return;
     try {
       const data = await fbLoad(QR_SELECTED_FB_KEY);
       const val = data && data.value;
@@ -18457,6 +18523,12 @@ async function doPrint(ticket, orderType){
 let btDevice = null; window.btDevice = null;
 let btCharacteristic = null; window.btCharacteristic = null;
 let btManualDisconnect = false; // true cuando el usuario desconecta a propósito (evita que se auto-reconecte)
+// BUG FIX: había dos mecanismos separados reconectando el GATT por su cuenta cuando se cortaba
+// la señal (el handler de "gattserverdisconnected" más abajo, y el reintento dentro de
+// btWriteChunk cuando un write fallaba) — podían quedar activos al mismo tiempo pisándose el uno
+// al otro sobre las mismas variables btDevice/btCharacteristic. Este candado simple asegura que
+// solo uno de los dos intente reconectar a la vez; el otro espera a que termine.
+let _btReconnecting = false;
 
 // Xprinter E-200L usa el servicio SPP o el servicio genérico ESC/POS BLE
 // UUIDs comunes para impresoras térmicas BLE:
@@ -18618,6 +18690,10 @@ function btSetupDisconnectHandler(device){
     const maxAttempts = 6;
     const tryReconnect = async ()=>{
       attempts++;
+      // Si btWriteChunk ya está reconectando por su cuenta en este momento, no competir por
+      // el mismo gatt.connect() — esperar un poco y reintentar más tarde.
+      if(_btReconnecting){ setTimeout(tryReconnect, 500); return; }
+      _btReconnecting = true;
       try {
         const server = await device.gatt.connect();
         const char = await btFindCharacteristic(server);
@@ -18633,6 +18709,8 @@ function btSetupDisconnectHandler(device){
           btCharacteristic = null; window.btCharacteristic = null;
           btUpdateBtn();
         }
+      } finally {
+        _btReconnecting = false;
       }
     };
     setTimeout(tryReconnect, 1200);
@@ -18779,12 +18857,22 @@ async function btWriteChunk(chunk, attempt){
       // btDevice/btCharacteristic sigan seteados. Antes de reintentar, forzamos
       // una reconexión del GATT si detectamos que ya no está conectado.
       try {
-        if(btDevice && btDevice.gatt && !btDevice.gatt.connected){
-          const server = await btDevice.gatt.connect();
-          const char = await btFindCharacteristic(server);
-          if(char){ btCharacteristic = char; window.btCharacteristic = char; }
+        if(_btReconnecting){
+          // El handler de desconexión ya está reconectando por su cuenta — no competir por el
+          // mismo gatt.connect(); solo esperar a que termine antes de reintentar el write.
+          await new Promise(r=>setTimeout(r, 500));
+        } else if(btDevice && btDevice.gatt && !btDevice.gatt.connected){
+          _btReconnecting = true;
+          try {
+            const server = await btDevice.gatt.connect();
+            const char = await btFindCharacteristic(server);
+            if(char){ btCharacteristic = char; window.btCharacteristic = char; }
+          } finally {
+            _btReconnecting = false;
+          }
         }
       } catch(reconnectErr){
+        _btReconnecting = false;
         console.warn('Reconexión GATT tras fallo de write no exitosa:', reconnectErr.message);
       }
       return btWriteChunk(chunk, attempt+1);
@@ -19016,7 +19104,20 @@ async function _btPrintTicketImpl(ticket){
       esc([0x1B,0x45,0x00]); // bold off
       esc([0x0A]);
     } catch(e){
+      // BUG FIX: si fallaba la conversión del QR a imagen para la impresora, el error solo
+      // quedaba en la consola técnica (invisible para el cajero) y el ticket salía sin QR y
+      // sin ningún aviso — el cliente no podía pagar escaneando el ticket y nadie se enteraba.
+      // Ahora al menos se imprime un texto con el nombre configurado para Yape, para que quede
+      // constancia en el papel de que hay que pagar por Yape aunque el QR no haya salido.
       console.error('No se pudo imprimir el QR de Yape:', e);
+      try {
+        const qrCfg = getQRConfig();
+        esc([0x0A]);
+        esc([0x1B,0x45,0x01]); // bold on
+        esc([...encodeText('Paga con Yape a: '+qrCfg.name)]);
+        esc([0x1B,0x45,0x00]); // bold off
+        esc([0x0A]);
+      } catch(e2){ console.error('Tampoco se pudo imprimir el texto de respaldo del Yape:', e2); }
     }
   }
 
@@ -19819,10 +19920,16 @@ function setTicketFilter(f){
 }
 
 function resetTicketsOfDay(){
-  if(!confirm('¿Reiniciar todos los tickets de hoy? Esta acción no se puede deshacer.')) return;
-  ticketsHistory = [];
-  saveTodayDirect(); // BUG FIX: Direct para no restaurar tickets desde Firebase tras el reset
-  renderTicketsHistory();
+  // BUG FIX: borrar UN ticket pide contraseña (ver deleteHistTicket), pero borrar TODOS los
+  // tickets del día con este botón solo pedía la confirmación normal del navegador — cualquiera
+  // con acceso a la pantalla podía borrar todo el historial del día sin la contraseña de
+  // administrador que sí se exige para acciones mucho menos destructivas. Ahora también la pide.
+  requestPwFor(()=>{
+    if(!confirm('¿Reiniciar todos los tickets de hoy? Esta acción no se puede deshacer.')) return;
+    ticketsHistory = [];
+    saveTodayDirect(); // BUG FIX: Direct para no restaurar tickets desde Firebase tras el reset
+    renderTicketsHistory();
+  }, '🔒 Reiniciar tickets del día');
 }
 
 function renderTicketsHistory(){
@@ -19960,6 +20067,25 @@ function deleteHistTicket(i){
     // Lista negra de tickets borrados para que el merge no los restaure desde Firebase
     if(!dayStats._deletedTickets) dayStats._deletedTickets = [];
     if(!dayStats._deletedTickets.includes(h.id)) dayStats._deletedTickets.push(h.id);
+    // BUG FIX: borrar un ticket aquí solo lo quitaba del Historial, pero la venta seguía
+    // sumando en "Ganancia del día" (Configuración) porque esa cifra sale de dayStats, no
+    // del Historial — la caja del día quedaba inflada. Ahora también se quita la entrada
+    // correspondiente en dayStats (buscada por histId, igual que hace deleteOrderEntry) y se
+    // descuenta su monto, y se registra en la misma lista negra de ganancias (_deletedIds)
+    // para que el merge con otros dispositivos no la vuelva a sumar.
+    const mode = o.type==='delivery'?'delivery': o.type==='mesa'?'mesa':'recoger';
+    const list = dayStats[mode] && dayStats[mode].orders;
+    if(list){
+      const idx = list.findIndex(e => e.histId === h.id);
+      if(idx >= 0){
+        dayStats[mode].total = Math.max(0, dayStats[mode].total - (list[idx].total||0));
+        dayStats[mode].count = Math.max(0, dayStats[mode].count - 1);
+        list.splice(idx, 1);
+        const deletedKey = `hid:${h.id}`;
+        if(!dayStats._deletedIds) dayStats._deletedIds = [];
+        if(!dayStats._deletedIds.includes(deletedKey)) dayStats._deletedIds.push(deletedKey);
+      }
+    }
     saveTodayDirect();
     renderTicketsHistory();
   }, '🔒 Borrar ticket');
@@ -20264,6 +20390,7 @@ let editingContactIdx = null;
 let dirSortMode = 'az'; // 'az' | 'orders'
 
 async function saveContacts(){
+  contactsManualChange = Date.now(); // bloquea el polling de syncContactsFromFB mientras esto termina de subir
   localStorage.setItem('bh_contacts', JSON.stringify(contacts));
   await fbSave('bh_contacts', contacts);
 }
@@ -20506,11 +20633,14 @@ function saveContact(){
   const address = document.getElementById('ct-address').value.trim();
   const delivery = parseFloat(document.getElementById('ct-delivery').value) || 1.00;
   if(!name || !phone || !address){ alert('Completa nombre, celular y dirección'); return; }
-  const c = {name, phone, address, delivery};
   if(editingContactIdx !== null){
-    contacts[editingContactIdx] = c;
+    // BUG FIX: antes se reemplazaba el contacto entero con {name,phone,address,delivery},
+    // perdiendo orderCount (número de pedidos) y totalSpent (dinero gastado) que ya tenía
+    // guardados — cada vez que se corregía el dato de un cliente, sus estadísticas de cliente
+    // frecuente se borraban de golpe. Ahora se conservan los campos que no vienen del formulario.
+    contacts[editingContactIdx] = Object.assign({}, contacts[editingContactIdx], {name, phone, address, delivery});
   } else {
-    contacts.push(c);
+    contacts.push({name, phone, address, delivery});
   }
   saveContacts();
   cancelAddContact();
@@ -20618,6 +20748,19 @@ function deleteOrderEntry(mode, idx){
         dayStats[mode].total = Math.max(0, dayStats[mode].total - ord.total);
         dayStats[mode].count = Math.max(0, dayStats[mode].count - 1);
         list.splice(idx, 1);
+        // BUG FIX: borrar la venta aquí (Configuración > Ganancias) no tocaba el Historial de
+        // Tickets — el ticket seguía apareciendo ahí y se podía reimprimir un pedido que ya no
+        // contaba en las ganancias. Ahora también se quita del Historial (por histId) y se
+        // registra en su lista negra para que el merge con otros dispositivos no lo restaure.
+        if(ord.histId != null){
+          const hIdx = ticketsHistory.findIndex(h => h.id === ord.histId);
+          if(hIdx >= 0){
+            ticketsHistory.splice(hIdx, 1);
+            if(!dayStats._deletedTickets) dayStats._deletedTickets = [];
+            if(!dayStats._deletedTickets.includes(ord.histId)) dayStats._deletedTickets.push(ord.histId);
+            renderTicketsHistory();
+          }
+        }
         saveTodayDirect();
         renderCfgPanel();
         // Reabrir el detalle que estaba abierto
@@ -21091,7 +21234,22 @@ function valeScanLoop(){
   _valeScanRAF = requestAnimationFrame(valeScanLoop);
 }
 
-function procesarValeEscaneado(dataStr){
+// BUG FIX: los vales solo vivían en localStorage del dispositivo donde se generaban, nunca se
+// sincronizaban a Firebase. Si el vale se escaneaba en OTRO celular/tablet, salía "no
+// reconocido" aunque fuera válido; y si por cualquier motivo terminaba guardado en dos
+// dispositivos, se podía canjear una vez en cada uno sin que ninguno se enterara del otro canje
+// (riesgo real con vales gratis). Fusiona por id, y una vez canjeado en cualquiera de los dos
+// lados queda canjeado para ambos (el canje nunca "se deshace" al fusionar).
+function mergeVales(local, remote){
+  const map = new Map();
+  for(const v of [...(local||[]), ...(remote||[])]){
+    const existing = map.get(v.id);
+    if(!existing || (v.canjeado && !existing.canjeado)) map.set(v.id, v);
+  }
+  return Array.from(map.values());
+}
+
+async function procesarValeEscaneado(dataStr){
   let payload;
   try{
     payload = JSON.parse(dataStr);
@@ -21110,6 +21268,15 @@ function procesarValeEscaneado(dataStr){
 
   let vales = [];
   try{ vales = JSON.parse(localStorage.getItem('bh_vales') || '[]'); }catch(e){ vales = []; }
+  // Traer la copia más fresca de Firebase (vales generados en otros dispositivos, o canjeados
+  // ahí mismo) antes de decidir si este vale es válido.
+  try{
+    const remote = await fbLoad('bh_vales');
+    if(Array.isArray(remote)){
+      vales = mergeVales(vales, remote);
+      localStorage.setItem('bh_vales', JSON.stringify(vales));
+    }
+  }catch(e){ console.warn('No se pudo refrescar vales desde Firebase, se usa la copia local:', e); }
   const idx = vales.findIndex(v => v.id === payload.id);
 
   const resumen = payload.items.map(it => `${it.q}x ${it.n}`).join(', ');
@@ -21132,6 +21299,7 @@ function procesarValeEscaneado(dataStr){
     vales[idx].canjeado = true;
     vales[idx].canjeadoFecha = new Date().toISOString();
     localStorage.setItem('bh_vales', JSON.stringify(vales));
+    fbSave('bh_vales', vales); // avisar a los demás dispositivos que este vale ya se usó
     resultEl.innerHTML = `<div style="background:#0a1a0f;border:1px solid #48bb7855;border-radius:10px;padding:14px;text-align:center;">
       <div style="font-size:15px;font-weight:700;color:#48bb78;">✅ Vale canjeado con éxito</div>
       <div style="font-size:12px;color:var(--gray);margin-top:6px;">${resumen} — ${precioTxt}</div>
@@ -21276,6 +21444,7 @@ function finalizarValeQR(total, esGratis){
     const vales = JSON.parse(localStorage.getItem('bh_vales') || '[]');
     vales.push(vale);
     localStorage.setItem('bh_vales', JSON.stringify(vales));
+    fbSave('bh_vales', vales); // para que se pueda canjear desde cualquier otro dispositivo
   }catch(e){
     console.warn('No se pudo guardar el vale en localStorage', e);
   }
