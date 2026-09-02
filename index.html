@@ -1275,7 +1275,6 @@ body.light-mode .me-save-bar{background:#f0efe9;border-color:#ddd;}
 <!-- WELCOME SCREEN — pantalla de bienvenida (5s) -->
 <div id="welcome-screen">
   <div class="we-glow"></div>
-  <div class="we-emoji">🍔</div>
   <h1 class="we-title">BURGER<span>HAN</span></h1>
   <div class="we-line"></div>
   <p class="we-tag">Sistema de Pedidos</p>
@@ -18882,13 +18881,16 @@ async function btWriteChunk(chunk, attempt){
   }
 }
 
-async function btWrite(data){
-  const CHUNK = 100;
+// opts permite mandar chunks más chicos y con más pausa para datos pesados/densos (ej. el
+// bitmap del QR) — ver BUG FIX en _btPrintTicketImpl, donde se usa para el QR de Yape.
+async function btWrite(data, opts){
+  const CHUNK = (opts && opts.chunk) || 100;
+  const DELAY = (opts && opts.delayMs != null) ? opts.delayMs : 40;
   for(let i=0; i<data.length; i+=CHUNK){
     const chunk = data.slice(i, i+CHUNK);
     await btWriteChunk(chunk);
     // Pequeña pausa entre chunks para no saturar el buffer
-    await new Promise(r=>setTimeout(r,40));
+    await new Promise(r=>setTimeout(r,DELAY));
   }
 }
 
@@ -18901,17 +18903,29 @@ async function imgToEscposBitmap(src, printWidth, opts){
     img.crossOrigin = 'anonymous';
     img.onload = ()=>{
       try {
+        // BUG FIX: la línea negra vertical que salía pegada al borde derecho del QR (solo del
+        // largo del QR, no del ticket completo) — la imagen del QR de Yape NO es cuadrada
+        // (ej. 700x670 px): trae una franja morada pegada al borde derecho que es parte del
+        // diseño de la captura de Yape, no del código QR (mismo problema que ya se había
+        // resuelto para la vista previa/cable en getYapeQRGrayscale, pero nunca acá — esta es
+        // la función que arma el ticket por Bluetooth, y mesa siempre imprime por Bluetooth).
+        // Sin recortarla, esa franja se escalaba junto con el QR y, al convertirla a blanco y
+        // negro, salía como una raya negra sólida. Se recorta a un cuadrado (el lado más
+        // chico) desde la esquina superior izquierda, igual que ya hacía la vista previa. Para
+        // una imagen ya cuadrada (ej. el QR de los vales, generado por la librería) esto no
+        // cambia nada — srcSize simplemente es el ancho/alto completo.
+        const srcSize = Math.min(img.width, img.height);
         // Escalar manteniendo proporción, dejando espacio para el margen
         const innerW = printWidth - pad*2;
-        const scale = innerW / img.width;
+        const scale = innerW / srcSize;
         const w = printWidth;
-        const h = Math.round(img.height * scale) + pad*2;
+        const h = Math.round(srcSize * scale) + pad*2;
         const canvas = document.createElement('canvas');
         canvas.width = w; canvas.height = h;
         const ctx = canvas.getContext('2d');
         ctx.fillStyle = '#fff';
         ctx.fillRect(0,0,w,h);
-        ctx.drawImage(img, pad, pad, innerW, h - pad*2);
+        ctx.drawImage(img, 0, 0, srcSize, srcSize, pad, pad, innerW, h - pad*2);
         const imageData = ctx.getImageData(0,0,w,h);
         const data = imageData.data;
 
@@ -19090,13 +19104,31 @@ async function _btPrintTicketImpl(ticket){
   if(isMesa && !isCopy){
     try {
       const qrCfg = getQRConfig();
-      const qrBitmap = await imgToEscposBitmap(qrCfg.img, 380, {pad: 10});
+      // BUG FIX: el ticket a veces tardaba mucho en imprimir y, muy rara vez, en vez del QR
+      // salía un ticket larguísimo con lo que parece "código" — texto basura. El bitmap del
+      // QR pesa ~15-20 KB (muchísimo más que el resto del texto del ticket), y antes viajaba
+      // mezclado con todo lo demás al mismo ritmo rápido pensado para texto (chunks de 100
+      // bytes, 40ms de pausa). El envío por Bluetooth acá es "sin confirmación" (más rápido,
+      // pero sin que la impresora avise si un byte se perdió): si se pierde uno justo en medio
+      // del bitmap, la impresora pierde el hilo del comando de imagen y empieza a interpretar
+      // el resto de los bytes como texto — de ahí el ticket larguísimo con símbolos raros. A
+      // más peso de datos, más chance de que esto pase (de ahí que fuera "rara vez"), y ese
+      // mismo ritmo lento-para-texto aplicado a tanto peso explica la demora. Ahora: 1) el QR
+      // se genera más chico (300px en vez de 380px, ~38% menos datos — sigue siendo grande y
+      // perfectamente escaneable en el ticket), y 2) el bitmap se manda aparte del resto del
+      // ticket, con chunks más chicos y más pausa entre ellos, dándole a la impresora más aire
+      // para vaciar su buffer mientras recibe la parte más pesada.
+      const qrBitmap = await imgToEscposBitmap(qrCfg.img, 300, {pad: 10});
       esc([0x0A]);
       esc([0x1B,0x45,0x01]); // bold on
       esc([...encodeText('Paga con Yape')]);
       esc([0x0A,0x0A]);
       esc([0x1B,0x45,0x00]); // bold off
-      for(const b of qrBitmap) cmds.push(b);
+      await btWrite(new Uint8Array(cmds));
+      cmds.length = 0;
+      await new Promise(r=>setTimeout(r, 150)); // dejar que la impresora respire antes del bloque pesado
+      await btWrite(qrBitmap, {chunk: 60, delayMs: 70});
+      await new Promise(r=>setTimeout(r, 150));
       esc([0x0A]);
       esc([0x1D,0x21,0x00]);
       esc([0x1B,0x45,0x01]); // bold on
@@ -21522,13 +21554,18 @@ async function imprimirValeTicket(){
   esc([0x0A]);
 
   // QR del vale
+  // BUG FIX: mismo bug que el QR de Yape en el ticket de mesa (ver _btPrintTicketImpl) — el
+  // bitmap se mandaba mezclado con el resto del texto al mismo ritmo rápido, con riesgo de que
+  // se perdiera un byte a mitad del bitmap (el write es "sin confirmación") y la impresora
+  // terminara imprimiendo el resto como texto basura. Se genera más chico (300px) y se manda
+  // aparte, con chunks más chicos y más pausa.
+  let qrBitmap = null;
   try{
-    const qrBitmap = await imgToEscposBitmap(qrDataUrl, 380, {pad: 10});
-    for(const b of qrBitmap) cmds.push(b);
-    esc([0x0A]);
+    qrBitmap = await imgToEscposBitmap(qrDataUrl, 300, {pad: 10});
   }catch(e){
     console.error('No se pudo generar el bitmap del QR del vale:', e);
   }
+  const _qrSplitIdx = cmds.length; // todo lo que sigue de acá se manda DESPUÉS del bitmap del QR
 
   // Precio
   esc([0x1D,0x21,0x11]); // doble ancho y alto
@@ -21555,7 +21592,16 @@ async function imprimirValeTicket(){
   esc([0x1D,0x56,0x42,0x00]); // cortar papel
 
   try{
-    const run = _btPrintQueue.then(() => btWrite(new Uint8Array(cmds)));
+    const run = _btPrintQueue.then(async () => {
+      await btWrite(new Uint8Array(cmds.slice(0, _qrSplitIdx))); // encabezado, ritmo normal
+      if(qrBitmap){
+        await new Promise(r=>setTimeout(r, 150)); // dejar que la impresora respire antes del bloque pesado
+        await btWrite(qrBitmap, {chunk: 60, delayMs: 70});
+        await btWrite(new Uint8Array([0x0A]));
+        await new Promise(r=>setTimeout(r, 150));
+      }
+      await btWrite(new Uint8Array(cmds.slice(_qrSplitIdx))); // precio/productos/corte, ritmo normal
+    });
     _btPrintQueue = run.catch(()=>{});
     await run;
   }catch(e){
